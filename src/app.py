@@ -10,7 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
-from .backend import routers, database
+
+try:
+    from .backend import routers, database
+except ImportError:
+    from backend import routers, database
 
 # Initialize web host
 app = FastAPI(
