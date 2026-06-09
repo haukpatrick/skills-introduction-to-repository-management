@@ -2,14 +2,150 @@
 MongoDB database configuration and setup for Mergington High School API
 """
 
+import os
+
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+MONGO_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/")
+MONGO_TIMEOUT_MS = int(os.environ.get("MONGO_TIMEOUT_MS", "2000"))
+
+activities_collection = None
+teachers_collection = None
+use_in_memory_db = False
+
+
+def _create_mongo_client():
+    return MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=MONGO_TIMEOUT_MS,
+        connectTimeoutMS=MONGO_TIMEOUT_MS,
+        socketTimeoutMS=MONGO_TIMEOUT_MS
+    )
+
+
+class InMemoryCollection:
+    def __init__(self, documents=None):
+        self._documents = []
+        if documents:
+            for document in documents:
+                self.insert_one(document.copy())
+
+    def _match_value(self, value, condition):
+        if isinstance(condition, dict):
+            if "$in" in condition:
+                return value in condition["$in"]
+            if "$gte" in condition:
+                return value >= condition["$gte"]
+            if "$lte" in condition:
+                return value <= condition["$lte"]
+            return False
+        return value == condition
+
+    def _get_nested(self, document, field_path):
+        current = document
+        for part in field_path.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return None
+        return current
+
+    def _matches(self, document, query):
+        for key, condition in query.items():
+            value = self._get_nested(document, key)
+            if not self._match_value(value, condition):
+                return False
+        return True
+
+    def count_documents(self, query):
+        return sum(1 for document in self._documents if self._matches(document, query))
+
+    def find(self, query):
+        for document in self._documents:
+            if self._matches(document, query):
+                yield document.copy()
+
+    def find_one(self, query):
+        for document in self._documents:
+            if self._matches(document, query):
+                return document.copy()
+        return None
+
+    def insert_one(self, document):
+        self._documents.append(document.copy())
+        return type("Result", (), {"inserted_id": document.get("_id")})
+
+    def update_one(self, filter_query, update_query):
+        modified_count = 0
+        for document in self._documents:
+            if self._matches(document, filter_query):
+                if "$push" in update_query:
+                    for field, value in update_query["$push"].items():
+                        target = self._get_nested(document, field.rsplit(".", 1)[0]) if "." in field else document
+                        key = field.rsplit(".", 1)[-1]
+                        if target is not None:
+                            target.setdefault(key, []).append(value)
+                            modified_count = 1
+                if "$pull" in update_query:
+                    for field, value in update_query["$pull"].items():
+                        target = self._get_nested(document, field.rsplit(".", 1)[0]) if "." in field else document
+                        key = field.rsplit(".", 1)[-1]
+                        if target is not None and isinstance(target.get(key), list):
+                            before = len(target[key])
+                            target[key] = [item for item in target[key] if item != value]
+                            if len(target[key]) != before:
+                                modified_count = 1
+                break
+        return type("Result", (), {"modified_count": modified_count})
+
+    def aggregate(self, pipeline):
+        documents = [document.copy() for document in self._documents]
+        for stage in pipeline:
+            if "$unwind" in stage:
+                unwind_field = stage["$unwind"].lstrip("$")
+                unwound = []
+                for document in documents:
+                    values = self._get_nested(document, unwind_field)
+                    if isinstance(values, list):
+                        for value in values:
+                            new_document = document.copy()
+                            target = new_document
+                            parts = unwind_field.split(".")
+                            for part in parts[:-1]:
+                                target = target.setdefault(part, {})
+                            target[parts[-1]] = value
+                            unwound.append(new_document)
+                documents = unwound
+            elif "$group" in stage:
+                group_id = stage["$group"]["_id"].lstrip("$")
+                grouped = {}
+                for document in documents:
+                    key = self._get_nested(document, group_id)
+                    grouped[key] = {"_id": key}
+                documents = list(grouped.values())
+            elif "$sort" in stage:
+                sort_field, direction = next(iter(stage["$sort"].items()))
+                documents.sort(key=lambda item: item.get(sort_field), reverse=direction < 0)
+        return documents
+
+
+def _initialize_collections():
+    global activities_collection, teachers_collection, use_in_memory_db
+
+    try:
+        client = _create_mongo_client()
+        client.admin.command("ping")
+        db = client["mergington_high"]
+        activities_collection = db["activities"]
+        teachers_collection = db["teachers"]
+        use_in_memory_db = False
+    except PyMongoError:
+        activities_collection = InMemoryCollection()
+        teachers_collection = InMemoryCollection()
+        use_in_memory_db = True
+
 
 # Methods
 def hash_password(password):
@@ -202,4 +338,7 @@ initial_teachers = [
         "role": "admin"
     }
 ]
+
+# Initialize collections after sample data is defined.
+_initialize_collections()
 
